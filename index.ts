@@ -5,6 +5,8 @@ import { rsiLogger } from "../../log";
 import { Service, Resource, Element, ResourceUpdate, StatusCode, ElementResponse, CollectionResponse } from "../rsiPlugin";
 import { RouteObject, RoutePolicyObject } from "./schema";
 
+import { createClient, GoogleMapsClient } from '@google/maps';
+
 class RoutePlanning extends Service {
   constructor() {
     super();
@@ -23,13 +25,29 @@ class Routes implements Resource {
   private _routes: BehaviorSubject<RouteElement>[] = [];
   private _change: BehaviorSubject<ResourceUpdate>;
   private _logger = rsiLogger.getInstance().getLogger("routeplanning");
+  private googleClient: GoogleMapsClient;
 
   constructor(private service: Service) {
     this._change = new BehaviorSubject(<ResourceUpdate>{ lastUpdate: Date.now(), action: 'init' });
+    this.googleClient = createClient({
+      key: 'AIzaSyCmx-uogQJpnUdB8RcRPZO6K0rxfZKeYIc',
+    });
   }
 
   get name(): string {
     return this.constructor.name;
+  };
+
+  directAddress(request: google.maps.DirectionsRequest): Promise<google.maps.DirectionsResult> {
+    return new Promise<google.maps.DirectionsResult>((resolve, reject) => {
+      this.googleClient.directions(request, (error, response) => {
+        if (error) {
+          reject(error);
+        }
+
+        resolve(response.json);
+      });
+    });
   };
 
   get elementSubscribable(): Boolean {
@@ -67,6 +85,19 @@ class Routes implements Resource {
       error: new Error('providing a name is mandatory'),
       code: StatusCode.INTERNAL_SERVER_ERROR
     };
+
+    if (!state.destination) return {
+      status: "error",
+      error: new Error('providing a destination is mandatory'),
+      code: StatusCode.INTERNAL_SERVER_ERROR
+    };
+
+    if (!state.destination.name) return {
+      status: "error",
+      error: new Error('providing a destination.name is mandatory'),
+      code: StatusCode.INTERNAL_SERVER_ERROR
+    };
+
     const routeId = uuid.v1();
 
     /** build the actual location and add it to the collections*/
@@ -77,13 +108,41 @@ class Routes implements Resource {
         data: {
           uri: "/" + this.service.name.toLowerCase() + "/" + this.name.toLowerCase() + "/" + routeId,
           id: routeId,
-          name: state.name
+          name: state.name,
+          destination: state.destination,
+          origin: state.origin,
         }
       });
     this._routes.push(newRoute);
 
     /** publish a resource change */
     this._change.next({ lastUpdate: Date.now(), action: "add" });
+
+    const request: google.maps.DirectionsRequest = {
+      destination: state.destination.name,
+      origin: state.origin.name,
+    };
+
+    this.directAddress(request).then((result) => {
+      if(result.routes.length >= 1) {
+        let route: RouteElement = newRoute.getValue();
+        let googleRoute = result.routes[0];
+        let newId = uuid.v1();
+
+        route.data.consumingTime = googleRoute.legs[0].duration.text;
+        route.data.distance = googleRoute.legs[0].distance.text;
+        route.data.path = (<any>googleRoute.overview_polyline).points;
+
+        newRoute.next(
+          {
+            lastUpdate: Date.now(),
+            propertiesChanged: ["consumingTime", "distance", "path"],
+            data: route.data
+          });
+      }
+    }).catch((error) => {
+      console.log("Error: " + error);
+    });
 
     /** return success */
     return { status: "ok", data: newRoute };
